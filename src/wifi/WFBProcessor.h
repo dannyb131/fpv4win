@@ -7,6 +7,7 @@
 
 #include "WFBDefine.h"
 #include <functional>
+#include <set>
 
 class BaseAggregator {
 public:
@@ -18,7 +19,10 @@ public:
 class Aggregator : public BaseAggregator {
 public:
     using DataCB = std::function<void(uint8_t *payload, uint16_t packet_size)>;
-    Aggregator(const std::string &keypair, uint64_t epoch, uint32_t channel_id, const DataCB &cb = nullptr);
+    using LogCB = std::function<void(const std::string &level, const std::string &message)>;
+    Aggregator(
+        const std::string &keypair, uint64_t epoch, uint32_t channel_id, const DataCB &cb = nullptr,
+        const LogCB &logCb = nullptr);
     ~Aggregator();
     virtual void
     process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi);
@@ -30,6 +34,7 @@ private:
     void apply_fec(int ring_idx);
     int get_block_ring_idx(uint64_t block_idx);
     int rx_ring_push(void);
+    void logOnce(const std::string &key, const std::string &level, const std::string &message);
     fec_t *fec_p;
     int fec_k; // RS number of primary fragments in block
     int fec_n; // RS total number of fragments in block
@@ -57,6 +62,8 @@ private:
     uint32_t count_p_override;
     // on data output
     DataCB dcb;
+    LogCB logCb;
+    std::set<std::string> loggedEvents;
 };
 
 #endif // WFBPROCESSOR_H

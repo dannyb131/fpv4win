@@ -344,6 +344,56 @@ ApplicationWindow {
                 }
             }
             Rectangle {
+                width: 190
+                height: streamTitle.height + 10
+                color: "#1c80c9"
+
+                Text {
+                    id: streamTitle
+                    x: 5
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Streaming server"
+                    font.pixelSize: 16
+                    color: "#ffffff"
+                }
+            }
+            TextField {
+                id: streamUrl
+                width: 190
+                placeholderText: "http://0.0.0.0:8080/stream.ts"
+                text: "http://0.0.0.0:8080/stream.ts"
+                selectByMouse: true
+            }
+            Button {
+                id: streamButton
+                width: 190
+                property bool streaming: false
+                text: streaming ? "STOP STREAM" : "START STREAM"
+
+                Component.onCompleted: {
+                    player.onStreamStopped.connect((error)=>{
+                        streaming = false;
+                        if (error !== "") {
+                            tips.showPop(error, 5000);
+                        }
+                    });
+                }
+
+                onClicked: {
+                    if (streaming) {
+                        player.stopStream();
+                        return;
+                    }
+                    let error = player.startStream(streamUrl.text);
+                    if (error === "") {
+                        streaming = true;
+                        tips.showPop("Streaming started", 3000);
+                    } else {
+                        tips.showPop(error, 5000);
+                    }
+                }
+            }
+            Rectangle {
                 // Size of the background adapts to the text size plus some padding
                 width: 190
                 height: actionText.height + 10
@@ -458,6 +508,39 @@ ApplicationWindow {
                 }
             }
             Rectangle {
+                width: 190
+                height: telemetryCountTitle.height + 10
+                color: "#1c80c9"
+
+                Text {
+                    id: telemetryCountTitle
+                    x: 5
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "MAVLink (Air→MP / MP→Air)"
+                    font.pixelSize: 14
+                    color: "#ffffff"
+                }
+            }
+            Row {
+                padding: 5
+                width: 190
+                Text {
+                    text: "" + NativeApi.telemetryRxCount
+                    font.pixelSize: 16
+                    color: "#000000"
+                }
+                Text {
+                    text: " / "
+                    font.pixelSize: 16
+                    color: "#000000"
+                }
+                Text {
+                    text: "" + NativeApi.telemetryTxCount
+                    font.pixelSize: 16
+                    color: "#000000"
+                }
+            }
+            Rectangle {
                 id:logTitle
                 z:2
                 // Size of the background adapts to the text size plus some padding
@@ -469,55 +552,39 @@ ApplicationWindow {
                     id: logText
                     x: 5
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "WiFi Driver Log"
+                    text: "Output Log (select to copy)"
                     font.pixelSize: 16
                     color: "#FFFFFF"
                 }
             }
             Rectangle {
                 width:190
-                height:window.height - 430
+                height:window.height - 590
                 color:"#f3f1f1"
                 clip:true
 
-                Component {
-                    id: contactDelegate
-                    Item {
-                        height:log.height
-                        Row {
-                            padding:2
-                            Text {
-                                id:log
-                                width: 190
-                                wrapMode: Text.Wrap
-                                font.pixelSize: 10
-                                text: '['+level+'] '+msg
-                                color: {
-                                    let colors = {
-                                        error: "#ff0000",
-                                        info: "#0f7340",
-                                        warn: "#e8c538",
-                                        debug: "#3296de",
-                                    }
-                                    return colors[level];
-                                }
-                            }
-                        }
-                    }
-                }
-
-                ListView {
+                ScrollView {
                     z:1
                     anchors.top :logTitle.bottom
                     anchors.fill: parent
                     anchors.margins:5
-                    model: ListModel {}
-                    delegate: contactDelegate
-                    Component.onCompleted: {
-                        NativeApi.onLog.connect((level,msg)=>{
-                            model.append({"level": level, "msg": msg});
-                            positionViewAtIndex(count - 1, ListView.End)
-                        });
+
+                    TextArea {
+                        id: outputLog
+                        readOnly: true
+                        selectByMouse: true
+                        wrapMode: TextEdit.Wrap
+                        font.pixelSize: 10
+                        color: "#202020"
+                        background: null
+
+                        Component.onCompleted: {
+                            append("Log file: " + NativeApi.GetLogFilePath())
+                            NativeApi.onLog.connect((level,msg)=>{
+                                append("[" + level + "] " + msg)
+                                cursorPosition = length
+                            });
+                        }
                     }
                 }
             }

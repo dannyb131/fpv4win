@@ -15,8 +15,6 @@ extern "C" {
 #include <string>
 #include <unordered_map>
 
-using namespace std;
-
 inline uint32_t htobe32(uint32_t host_32bits) {
     // 检查主机字节序是否为小端模式
     uint16_t test = 0x1;
@@ -133,8 +131,8 @@ public:
             rssi_min = rssi;
             rssi_max = rssi;
         } else {
-            rssi_min = min(rssi, rssi_min);
-            rssi_max = max(rssi, rssi_max);
+            rssi_min = std::min(rssi, rssi_min);
+            rssi_max = std::max(rssi, rssi_max);
         }
         rssi_sum += rssi;
         count_all += 1;
@@ -184,14 +182,18 @@ typedef struct {
 } wpacket_hdr_t;
 #pragma pack(pop)
 
+// Current wfb-ng (and current OpenIPC firmware) uses jumbo injected frames.
+// WIFI_MTU includes the 802.11 header and all WFB headers, but not radiotap.
+// Keeping the old 1510-byte limit drops the camera's 3994-byte video packets
+// before they can be decrypted.
+#define WIFI_MTU 4045
 #define MAX_PAYLOAD_SIZE                                                                                               \
-    (MAX_PACKET_SIZE - sizeof(radiotap_header) - sizeof(ieee80211_header) - sizeof(wblock_hdr_t)                       \
-     - crypto_aead_chacha20poly1305_ABYTES - sizeof(wpacket_hdr_t))
+    (WIFI_MTU - sizeof(ieee80211_header) - sizeof(wblock_hdr_t) - crypto_aead_chacha20poly1305_ABYTES                  \
+     - sizeof(wpacket_hdr_t))
 #define MAX_FEC_PAYLOAD                                                                                                \
-    (MAX_PACKET_SIZE - sizeof(radiotap_header) - sizeof(ieee80211_header) - sizeof(wblock_hdr_t)                       \
-     - crypto_aead_chacha20poly1305_ABYTES)
-#define MAX_PACKET_SIZE 1510
-#define MAX_FORWARDER_PACKET_SIZE (MAX_PACKET_SIZE - sizeof(radiotap_header) - sizeof(ieee80211_header))
+    (WIFI_MTU - sizeof(ieee80211_header) - sizeof(wblock_hdr_t) - crypto_aead_chacha20poly1305_ABYTES)
+#define MAX_FORWARDER_PACKET_SIZE (WIFI_MTU - sizeof(ieee80211_header))
+#define MAX_SESSION_PACKET_SIZE (WIFI_MTU - sizeof(ieee80211_header))
 
 #define BLOCK_IDX_MASK ((1LLU << 56) - 1)
 #define MAX_BLOCK_IDX ((1LLU << 55) - 1)

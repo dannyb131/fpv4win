@@ -9,6 +9,7 @@
 
 #include "GifEncoder.h"
 #include "Mp4Encoder.h"
+#include "StreamPublisher.h"
 
 class TItemRender;
 
@@ -40,6 +41,9 @@ public:
     // 录像
     Q_INVOKABLE bool startRecord();
     Q_INVOKABLE QString stopRecord();
+    // 推流
+    Q_INVOKABLE QString startStream(const QString &streamUrl);
+    Q_INVOKABLE void stopStream();
     // 录制GIF
     Q_INVOKABLE bool startGifRecord();
     Q_INVOKABLE void stopGifRecord();
@@ -61,6 +65,8 @@ signals:
     void onMutedChanged(bool muted);
     // 是否有音频
     void onHasAudio(bool has);
+    // 推流停止；error 为空表示由用户停止
+    void onStreamStopped(QString error);
 
     friend class TItemRender;
 
@@ -90,6 +96,10 @@ protected:
     void disableAudio();
     // MP4录制器
     shared_ptr<Mp4Encoder> _mp4Encoder;
+    // 网络推流器
+    shared_ptr<StreamPublisher> _streamPublisher;
+    // 保护录制器和推流器；解码回调在后台线程运行
+    mutex outputMutex;
     // GIF录制器
     shared_ptr<GifEncoder> _gifEncoder;
     // 是否有声音

@@ -9,18 +9,19 @@
 bool FFmpegDecoder::OpenInput(string &inputFile) {
     CloseInput();
 
-    if (!isHwDecoderEnable) {
-        hwDecoderType = av_hwdevice_find_type_by_name("d3d11va");
-        if (hwDecoderType != AV_HWDEVICE_TYPE_NONE) {
-            isHwDecoderEnable = true;
-        }
-    }
+    // Prefer Windows D3D11 hardware decoding. OpenVideo() falls back to the
+    // normal software decoder if the codec or GPU cannot provide it.
+    hwDecoderType = AV_HWDEVICE_TYPE_D3D11VA;
+    hwPixFmt = AV_PIX_FMT_NONE;
+    isHwDecoderEnable = true;
 
     AVDictionary *param = nullptr;
 
     av_dict_set(&param, "preset", "ultrafast", 0);
     av_dict_set(&param, "tune", "zerolatency", 0);
     av_dict_set(&param, "buffer_size", "425984", 0);
+    av_dict_set(&param, "fflags", "nobuffer", 0);
+    av_dict_set(&param, "flags", "low_delay", 0);
     av_dict_set(&param, "rtsp_transport", "tcp", 0);
     av_dict_set(&param, "protocol_whitelist", "file,udp,tcp,rtp,rtmp,rtsp,http", 0);
 
@@ -190,6 +191,22 @@ bool FFmpegDecoder::hwDecoderInit(AVCodecContext *ctx, const enum AVHWDeviceType
     return true;
 }
 
+enum AVPixelFormat FFmpegDecoder::selectHardwareFormat(
+    AVCodecContext *ctx, const enum AVPixelFormat *formats) {
+    auto *decoder = static_cast<FFmpegDecoder *>(ctx->opaque);
+    if (!decoder) {
+        return formats[0];
+    }
+
+    for (const enum AVPixelFormat *format = formats; *format != AV_PIX_FMT_NONE; ++format) {
+        if (*format == decoder->hwPixFmt) {
+            return *format;
+        }
+    }
+
+    return AV_PIX_FMT_NONE;
+}
+
 bool FFmpegDecoder::OpenVideo() {
     bool res = false;
 
@@ -222,10 +239,32 @@ bool FFmpegDecoder::OpenVideo() {
                     if (pVideoCodecCtx) {
                         if (isHwDecoderEnable) {
                             isHwDecoderEnable = hwDecoderInit(pVideoCodecCtx, hwDecoderType);
+                            if (isHwDecoderEnable) {
+                                pVideoCodecCtx->opaque = this;
+                                pVideoCodecCtx->get_format = &FFmpegDecoder::selectHardwareFormat;
+                            }
                         }
 
                         if (avcodec_parameters_to_context(pVideoCodecCtx, pFormatCtx->streams[i]->codecpar) >= 0) {
+                            pVideoCodecCtx->flags |= AV_CODEC_FLAG_LOW_DELAY;
                             res = !(avcodec_open2(pVideoCodecCtx, codec, nullptr) < 0);
+                            if (!res && isHwDecoderEnable) {
+                                // A D3D11 device may exist while the GPU does
+                                // not support this particular codec/profile.
+                                // Retry the same stream with software decoding.
+                                avcodec_free_context(&pVideoCodecCtx);
+                                av_buffer_unref(&hwDeviceCtx);
+                                isHwDecoderEnable = false;
+                                hwPixFmt = AV_PIX_FMT_NONE;
+                                pVideoCodecCtx = avcodec_alloc_context3(codec);
+                                if (pVideoCodecCtx
+                                    && avcodec_parameters_to_context(
+                                           pVideoCodecCtx, pFormatCtx->streams[i]->codecpar)
+                                           >= 0) {
+                                    pVideoCodecCtx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+                                    res = avcodec_open2(pVideoCodecCtx, codec, nullptr) >= 0;
+                                }
+                            }
                             if (res) {
                                 width = pVideoCodecCtx->width;
                                 height = pVideoCodecCtx->height;
@@ -270,7 +309,7 @@ bool FFmpegDecoder::DecodeVideo(const AVPacket *av_pkt, shared_ptr<AVFrame> &pOu
 
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             // No output available right now or end of stream
-            res = false;
+            return false;
         } else if (ret < 0) {
             char errStr[AV_ERROR_MAX_STRING_SIZE];
             av_strerror(ret, errStr, AV_ERROR_MAX_STRING_SIZE);
@@ -282,17 +321,54 @@ bool FFmpegDecoder::DecodeVideo(const AVPacket *av_pkt, shared_ptr<AVFrame> &pOu
 
         if (isHwDecoderEnable) {
             if (dropCurrentVideoFrame) {
+                av_frame_unref(hwFrame.get());
                 pOutFrame.reset();
                 return false;
             }
 
-            // Copy data from the hw surface to the out frame.
-            ret = av_hwframe_transfer_data(pOutFrame.get(), hwFrame.get(), 0);
+            if (hwFrame->format == hwPixFmt) {
+                // Copy data from the D3D11 surface to memory the OpenGL renderer
+                // can upload. Keep the transfer frame separate because D3D11
+                // normally downloads as NV12, whose two-channel OpenGL upload
+                // is unreliable on some Windows/Qt graphics backends.
+                shared_ptr<AVFrame> transferFrame(av_frame_alloc(), &freeFrame);
+                ret = av_hwframe_transfer_data(transferFrame.get(), hwFrame.get(), 0);
+                av_frame_unref(hwFrame.get());
 
-            if (ret < 0) {
-                char errStr[AV_ERROR_MAX_STRING_SIZE];
-                av_strerror(ret, errStr, AV_ERROR_MAX_STRING_SIZE);
-                throw runtime_error("Decode video frame error. " + string(errStr));
+                if (ret < 0) {
+                    char errStr[AV_ERROR_MAX_STRING_SIZE];
+                    av_strerror(ret, errStr, AV_ERROR_MAX_STRING_SIZE);
+                    throw runtime_error("Decode video frame error. " + string(errStr));
+                }
+
+                if (transferFrame->format == AV_PIX_FMT_NV12) {
+                    pOutFrame->format = AV_PIX_FMT_YUV420P;
+                    pOutFrame->width = transferFrame->width;
+                    pOutFrame->height = transferFrame->height;
+                    if (av_frame_get_buffer(pOutFrame.get(), 32) < 0) {
+                        throw runtime_error("Unable to allocate hardware decode conversion frame");
+                    }
+
+                    pImgConvertCtx = sws_getCachedContext(
+                        pImgConvertCtx, transferFrame->width, transferFrame->height,
+                        static_cast<AVPixelFormat>(transferFrame->format), transferFrame->width,
+                        transferFrame->height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                    if (!pImgConvertCtx
+                        || sws_scale(
+                               pImgConvertCtx, transferFrame->data, transferFrame->linesize, 0,
+                               transferFrame->height, pOutFrame->data, pOutFrame->linesize)
+                            <= 0) {
+                        throw runtime_error("Unable to convert hardware NV12 frame for display");
+                    }
+                    av_frame_copy_props(pOutFrame.get(), transferFrame.get());
+                } else {
+                    av_frame_move_ref(pOutFrame.get(), transferFrame.get());
+                }
+            } else {
+                // Some FFmpeg/driver combinations accept a hardware device but
+                // still select software output. Preserve that valid frame rather
+                // than treating it as a D3D11 surface.
+                av_frame_move_ref(pOutFrame.get(), hwFrame.get());
             }
         }
     }
@@ -333,17 +409,22 @@ bool FFmpegDecoder::OpenAudio() {
 }
 
 void FFmpegDecoder::CloseVideo() {
-    if (pVideoCodecCtx) {
-        avcodec_close(pVideoCodecCtx);
-        pVideoCodecCtx = nullptr;
-        videoStreamIndex = 0;
+    hwFrame.reset();
+    if (pImgConvertCtx) {
+        sws_freeContext(pImgConvertCtx);
+        pImgConvertCtx = nullptr;
     }
+    if (pVideoCodecCtx) {
+        avcodec_free_context(&pVideoCodecCtx);
+    }
+    av_buffer_unref(&hwDeviceCtx);
+    hwPixFmt = AV_PIX_FMT_NONE;
+    videoStreamIndex = -1;
 }
 
 void FFmpegDecoder::CloseAudio() {
     if (pAudioCodecCtx) {
-        avcodec_close(pAudioCodecCtx);
-        pAudioCodecCtx = nullptr;
+        avcodec_free_context(&pAudioCodecCtx);
         audioStreamIndex = 0;
     }
 }

@@ -5,6 +5,7 @@
 #ifndef CTRLCENTER_QMLNATIVEAPI_H
 #define CTRLCENTER_QMLNATIVEAPI_H
 #include "wifi/WFBReceiver.h"
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonObject>
@@ -12,6 +13,7 @@
 #include <QUdpSocket>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <util/mini.h>
 
 using namespace toolkit;
@@ -31,13 +33,18 @@ class QmlNativeAPI : public QObject {
     Q_PROPERTY(qulonglong wifiFrameCount READ wifiFrameCount NOTIFY onWifiFrameCount)
     Q_PROPERTY(qulonglong wfbFrameCount READ wfbFrameCount NOTIFY onWfbFrameCount)
     Q_PROPERTY(qulonglong rtpPktCount READ rtpPktCount NOTIFY onRtpPktCount)
+    Q_PROPERTY(qulonglong telemetryRxCount READ telemetryRxCount NOTIFY onTelemetryRxCount)
+    Q_PROPERTY(qulonglong telemetryTxCount READ telemetryTxCount NOTIFY onTelemetryTxCount)
 public:
     static QmlNativeAPI &Instance() {
         static QmlNativeAPI api;
         return api;
     }
     explicit QmlNativeAPI(QObject *parent = nullptr)
-        : QObject(parent) {
+        : QObject(parent)
+        , logFilePath_(QDir(QCoreApplication::applicationDirPath()).filePath("fpv4win.log")) {
+        // Start each application run with a fresh, easy-to-share log file.
+        std::ofstream(logFilePath_.toStdString(), std::ios::trunc);
         // load config
         try {
             mINI::Instance().parseFile(CONFIG_FILE);
@@ -100,8 +107,14 @@ public:
                 + " Port:" + std::to_string(port));
     }
     void PutLog(const std::string &level, const std::string &msg) {
+        {
+            std::lock_guard<std::mutex> lock(logFileMutex_);
+            std::ofstream logFile(logFilePath_.toStdString(), std::ios::app);
+            logFile << '[' << level << "] " << msg << '\n';
+        }
         emit onLog(QString(level.c_str()), QString(msg.c_str()));
     }
+    Q_INVOKABLE QString GetLogFilePath() const { return QDir::toNativeSeparators(logFilePath_); }
     void NotifyWifiStop() { emit onWifiStop(); }
     int NotifyRtpStream(int pt, uint16_t ssrc) {
         // get free port
@@ -114,18 +127,28 @@ public:
         emit onWifiFrameCount(wifiFrameCount_);
         emit onWfbFrameCount(wfbFrameCount_);
         emit onRtpPktCount(rtpPktCount_);
+        emit onTelemetryRxCount(telemetryRxCount_);
+        emit onTelemetryTxCount(telemetryTxCount_);
     }
     qulonglong wfbFrameCount() { return wfbFrameCount_; }
     qulonglong rtpPktCount() { return rtpPktCount_; }
     qulonglong wifiFrameCount() { return wifiFrameCount_; }
+    qulonglong telemetryRxCount() { return telemetryRxCount_; }
+    qulonglong telemetryTxCount() { return telemetryTxCount_; }
     Q_INVOKABLE int GetPlayerPort() { return playerPort; }
     Q_INVOKABLE QString GetPlayerCodec() const { return playerCodec; }
     int GetFreePort() { return 52356; }
     qulonglong wfbFrameCount_ = 0;
     qulonglong wifiFrameCount_ = 0;
     qulonglong rtpPktCount_ = 0;
+    std::atomic<qulonglong> telemetryRxCount_ { 0 };
+    std::atomic<qulonglong> telemetryTxCount_ { 0 };
     int playerPort = 0;
     QString playerCodec;
+private:
+    QString logFilePath_;
+    std::mutex logFileMutex_;
+
 signals:
     // onlog
     void onLog(QString level, QString msg);
@@ -133,6 +156,8 @@ signals:
     void onWifiFrameCount(qulonglong count);
     void onWfbFrameCount(qulonglong count);
     void onRtpPktCount(qulonglong count);
+    void onTelemetryRxCount(qulonglong count);
+    void onTelemetryTxCount(qulonglong count);
     void onRtpStream(QString sdp);
 };
 

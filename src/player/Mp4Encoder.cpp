@@ -47,7 +47,9 @@ bool Mp4Encoder::start() {
     AVDictionary *opts = nullptr;
     av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov", 0);
     int ret = avformat_write_header(_formatCtx.get(), &opts);
+    av_dict_free(&opts);
     if (ret < 0) {
+        avio_closep(&_formatCtx->pb);
         return false;
     }
     _isOpen = true;
@@ -58,26 +60,31 @@ void Mp4Encoder::writePacket(const shared_ptr<AVPacket> &pkt, bool isVideo) {
     if (!_isOpen) {
         return;
     }
+    shared_ptr<AVPacket> outputPacket(
+        av_packet_clone(pkt.get()), [](AVPacket *packet) { av_packet_free(&packet); });
+    if (!outputPacket) {
+        return;
+    }
 #ifdef I_FRAME_FIRST
     // 未获取视频关键帧前先忽略音频
     if (videoIndex >= 0 && !writtenKeyFrame && !isVideo) {
         return;
     }
     // 跳过非关键帧，使关键帧前置
-    if (!writtenKeyFrame && pkt->flags & AV_PKT_FLAG_KEY) {
+    if (!writtenKeyFrame && !(outputPacket->flags & AV_PKT_FLAG_KEY)) {
         return;
     }
     writtenKeyFrame = true;
 #endif
     if (isVideo) {
-        pkt->stream_index = videoIndex;
-        av_packet_rescale_ts(pkt.get(), _originVideoTimeBase, _formatCtx->streams[videoIndex]->time_base);
+        outputPacket->stream_index = videoIndex;
+        av_packet_rescale_ts(outputPacket.get(), _originVideoTimeBase, _formatCtx->streams[videoIndex]->time_base);
     } else {
-        pkt->stream_index = audioIndex;
-        av_packet_rescale_ts(pkt.get(), _originAudioTimeBase, _formatCtx->streams[audioIndex]->time_base);
+        outputPacket->stream_index = audioIndex;
+        av_packet_rescale_ts(outputPacket.get(), _originAudioTimeBase, _formatCtx->streams[audioIndex]->time_base);
     }
-    pkt->pos = -1;
-    av_write_frame(_formatCtx.get(), pkt.get());
+    outputPacket->pos = -1;
+    av_write_frame(_formatCtx.get(), outputPacket.get());
 }
 
 void Mp4Encoder::stop() {
@@ -85,5 +92,5 @@ void Mp4Encoder::stop() {
     // 写文件尾
     av_write_trailer(_formatCtx.get());
     // 关闭文件
-    avio_close(_formatCtx->pb);
+    avio_closep(&_formatCtx->pb);
 }

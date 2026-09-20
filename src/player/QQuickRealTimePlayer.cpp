@@ -1,12 +1,14 @@
 ﻿
 #include "QQuickRealTimePlayer.h"
 #include "JpegEncoder.h"
+#include "QmlNativeAPI.h"
 #include <QDir>
 #include <QOpenGLFramebufferObject>
 #include <QQuickWindow>
 #include <QStandardPaths>
 #include <SDL2/SDL.h>
 #include <future>
+#include <libavutil/pixdesc.h>
 #include <sstream>
 // GIF默认帧率
 #define DEFAULT_GIF_FRAMERATE 10
@@ -129,12 +131,31 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
         // 打开并分析输入
         bool ok = decoder_->OpenInput(url);
         if (!ok) {
+            QmlNativeAPI::Instance().PutLog("error", "FFmpeg could not open the RTP video stream");
             emit onError("视频加载出错", -2);
             return;
         }
         decoder = decoder_;
+        if (decoder->HasVideo()) {
+            QmlNativeAPI::Instance().PutLog(
+                "info", "FFmpeg opened " + std::string(avcodec_get_name(decoder->pVideoCodecCtx->codec_id))
+                    + " video using " + (decoder->isHwDecoderEnable ? "D3D11 hardware" : "software")
+                    + " decoding");
+        } else {
+            QmlNativeAPI::Instance().PutLog("error", "FFmpeg opened the input but found no video stream");
+        }
+        decoder->_gotPktCallback = [this](const shared_ptr<AVPacket> &packet) {
+            lock_guard<mutex> lock(outputMutex);
+            if (_mp4Encoder) {
+                _mp4Encoder->writePacket(packet, packet->stream_index == decoder->videoStreamIndex);
+            }
+            if (_streamPublisher && _streamPublisher->isRunning()) {
+                _streamPublisher->enqueuePacket(packet);
+            }
+        };
         // 启动解码线程
         decodeThread = std::thread([this]() {
+            bool loggedFirstFrame = false;
             while (!playStop) {
                 try {
                     // 循环解码
@@ -142,15 +163,30 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
                     if (!frame) {
                         continue;
                     }
+                    if (!loggedFirstFrame) {
+                        const char *pixelFormat = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
+                        QmlNativeAPI::Instance().PutLog(
+                            "info", "Decoded first video frame " + std::to_string(frame->width) + "x"
+                                + std::to_string(frame->height) + " format "
+                                + (pixelFormat ? pixelFormat : "unknown"));
+                        loggedFirstFrame = true;
+                    }
+                    if (frame->width != m_videoWidth || frame->height != m_videoHeight
+                        || frame->format != m_videoFormat) {
+                        onVideoInfoReady(frame->width, frame->height, frame->format);
+                    }
                     {
                         // 解码获取到视频帧,放入帧缓冲队列
                         lock_guard<mutex> lck(mtx);
-                        if (videoFrameQueue.size() > 10) {
+                        // Live FPV should discard stale decoded frames instead
+                        // of accumulating a latency-producing playback queue.
+                        while (videoFrameQueue.size() >= 2) {
                             videoFrameQueue.pop();
                         }
                         videoFrameQueue.push(frame);
                     }
                 } catch (const exception &e) {
+                    QmlNativeAPI::Instance().PutLog("error", "FFmpeg decode failed: " + std::string(e.what()));
                     emit onError(e.what(), -2);
                     // 出错，停止
                     break;
@@ -180,6 +216,7 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
 }
 
 void QQuickRealTimePlayer::stop() {
+    stopStream();
     playStop = true;
     if (decoder && decoder->pFormatCtx) {
         decoder->pFormatCtx->interrupt_callback.callback = [](void *) { return 1; };
@@ -257,35 +294,75 @@ bool QQuickRealTimePlayer::startRecord() {
               .count()
        << ".mp4";
     // 创建MP4编码器
-    _mp4Encoder = make_shared<Mp4Encoder>(ss.str());
+    auto encoder = make_shared<Mp4Encoder>(ss.str());
 
     // 添加音频流
     if (decoder->HasAudio()) {
-        _mp4Encoder->addTrack(decoder->pFormatCtx->streams[decoder->audioStreamIndex]);
+        encoder->addTrack(decoder->pFormatCtx->streams[decoder->audioStreamIndex]);
     }
     // 添加视频流
     if (decoder->HasVideo()) {
-        _mp4Encoder->addTrack(decoder->pFormatCtx->streams[decoder->videoStreamIndex]);
+        encoder->addTrack(decoder->pFormatCtx->streams[decoder->videoStreamIndex]);
     }
-    if (!_mp4Encoder->start()) {
+    if (!encoder->start()) {
         return false;
     }
-    // 设置获得NALU回调
-    decoder->_gotPktCallback = [this](const shared_ptr<AVPacket> &packet) {
-        // 输入编码器
-        _mp4Encoder->writePacket(packet, packet->stream_index == decoder->videoStreamIndex);
-    };
+    lock_guard<mutex> lock(outputMutex);
+    _mp4Encoder = std::move(encoder);
     // 启动编码器
     return true;
 }
 
 QString QQuickRealTimePlayer::stopRecord() {
+    lock_guard<mutex> lock(outputMutex);
     if (!_mp4Encoder) {
         return {};
     }
     _mp4Encoder->stop();
-    decoder->_gotPktCallback = nullptr;
-    return { _mp4Encoder->_saveFilePath.c_str() };
+    QString path { _mp4Encoder->_saveFilePath.c_str() };
+    _mp4Encoder.reset();
+    return path;
+}
+
+QString QQuickRealTimePlayer::startStream(const QString &streamUrl) {
+    if (!decoder || !decoder->pFormatCtx || (!decoder->HasAudio() && !decoder->HasVideo())) {
+        return "Start the receiver and wait for video before streaming.";
+    }
+
+    const std::string target = streamUrl.trimmed().toStdString();
+    auto publisher = make_shared<StreamPublisher>(target);
+    if (decoder->HasAudio()
+        && !publisher->addTrack(decoder->pFormatCtx->streams[decoder->audioStreamIndex])) {
+        return QString::fromStdString(publisher->lastError());
+    }
+    if (decoder->HasVideo()
+        && !publisher->addTrack(decoder->pFormatCtx->streams[decoder->videoStreamIndex])) {
+        return QString::fromStdString(publisher->lastError());
+    }
+    publisher->onError = [this](const std::string &error) { emit onStreamStopped(QString::fromStdString(error)); };
+    if (!publisher->start()) {
+        return QString::fromStdString(publisher->lastError());
+    }
+    {
+        lock_guard<mutex> lock(outputMutex);
+        if (_streamPublisher) {
+            _streamPublisher->stop();
+        }
+        _streamPublisher = std::move(publisher);
+    }
+    return {};
+}
+
+void QQuickRealTimePlayer::stopStream() {
+    {
+        lock_guard<mutex> lock(outputMutex);
+        if (!_streamPublisher) {
+            return;
+        }
+        _streamPublisher->stop();
+        _streamPublisher.reset();
+    }
+    emit onStreamStopped(QString());
 }
 
 int QQuickRealTimePlayer::getVideoWidth() {

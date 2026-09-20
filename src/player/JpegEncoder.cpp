@@ -125,8 +125,6 @@ bool JpegEncoder::encodeJpeg(const string &outFilePath, const shared_ptr<AVFrame
     av_write_frame(pFormatCtx.get(), pkt.get());
     // 写文件尾
     av_write_trailer(pFormatCtx.get());
-    // 关闭编码器
-    avcodec_close(codecCtx.get());
     // 关闭文件
     avio_close(pFormatCtx->pb);
     return true;

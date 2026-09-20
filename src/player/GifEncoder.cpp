@@ -124,7 +124,7 @@ void GifEncoder::close() {
     }
     if (_codecCtx) {
         // 关闭编码器
-        avcodec_close(_codecCtx.get());
+        _codecCtx.reset();
     }
     // 关闭文件
     avio_close(_formatCtx->pb);

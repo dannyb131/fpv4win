@@ -43,7 +43,7 @@ void main(void)
         // NV12
         yuv.x = texture2D(tex_y, v_texCoord).r;
         yuv.y = texture2D(tex_u, v_texCoord).r - 0.5;
-        yuv.z = texture2D(tex_u, v_texCoord).a - 0.5;
+        yuv.z = texture2D(tex_u, v_texCoord).g - 0.5;
         rgb = mat3( 1.0,       1.0,         1.0,
                     0.0,       -0.3455,  1.779,
                     1.4075, -0.7169,  0.0) * yuv;
@@ -122,23 +122,25 @@ void RealTimeRenderer::initShader() {
     mProgram.bind();
 }
 void RealTimeRenderer::initTexture() {
-    // yuv420p
+    // Use explicit normalized red-channel textures. Legacy GL_LUMINANCE
+    // textures are not reliable in the core OpenGL contexts used by current
+    // Qt/Windows drivers and can render a decoded frame as one flat colour.
     mTexY = new QOpenGLTexture(QOpenGLTexture::Target2D);
-    mTexY->setFormat(QOpenGLTexture::LuminanceFormat);
+    mTexY->setFormat(QOpenGLTexture::R8_UNorm);
     //    mTexY->setFixedSamplePositions(false);
     mTexY->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexY->setMagnificationFilter(QOpenGLTexture::Nearest);
     mTexY->setWrapMode(QOpenGLTexture::ClampToEdge);
 
     mTexU = new QOpenGLTexture(QOpenGLTexture::Target2D);
-    mTexU->setFormat(mPixFmt == AV_PIX_FMT_NV12?QOpenGLTexture::LuminanceAlphaFormat:QOpenGLTexture::LuminanceFormat);
+    mTexU->setFormat(mPixFmt == AV_PIX_FMT_NV12 ? QOpenGLTexture::RG8_UNorm : QOpenGLTexture::R8_UNorm);
     //    mTexU->setFixedSamplePositions(false);
     mTexU->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexU->setMagnificationFilter(QOpenGLTexture::Nearest);
     mTexU->setWrapMode(QOpenGLTexture::ClampToEdge);
 
     mTexV = new QOpenGLTexture(QOpenGLTexture::Target2D);
-    mTexV->setFormat(QOpenGLTexture::LuminanceFormat);
+    mTexV->setFormat(QOpenGLTexture::R8_UNorm);
     //    mTexV->setFixedSamplePositions(false);
     mTexV->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexV->setMagnificationFilter(QOpenGLTexture::Nearest);
@@ -154,41 +156,49 @@ void RealTimeRenderer::initGeometry() {
     mModelMatrix.setToIdentity();
 }
 void RealTimeRenderer::updateTextureInfo(int width, int height, int format) {
-    mPixFmt = format;
-    if(!inited) {
-        inited = true;
-        initTexture();
+    // QOpenGLTexture storage is immutable after allocation. Recreate all
+    // planes when the decoder changes size or pixel format (for example when
+    // switching from a D3D11/NV12 session to planar display frames).
+    if (inited) {
+        safeDeleteTexture(mTexY);
+        safeDeleteTexture(mTexU);
+        safeDeleteTexture(mTexV);
+        mTextureAlloced = false;
+        inited = false;
     }
+    mPixFmt = format;
+    inited = true;
+    initTexture();
     if (format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P) {
         // yuv420p
         mTexY->setSize(width, height);
-        mTexY->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexY->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
 
         mTexU->setSize(width / 2, height / 2);
-        mTexU->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexU->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
 
         mTexV->setSize(width / 2, height / 2);
-        mTexV->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexV->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
     } else if (format == AV_PIX_FMT_NV12) {
         mTexY->setSize(width, height);
-        mTexY->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexY->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
 
         mTexU->setSize(width / 2, height / 2);
-        mTexU->allocateStorage(QOpenGLTexture::LuminanceAlpha, QOpenGLTexture::UInt8);
+        mTexU->allocateStorage(QOpenGLTexture::RG, QOpenGLTexture::UInt8);
 
         // NV12 not use for v
         mTexV->setSize(2, 2);
-        mTexV->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexV->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
     } else {
         // 先按yuv444p处理
         mTexY->setSize(width, height);
-        mTexY->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexY->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
 
         mTexU->setSize(width, height);
-        mTexU->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexU->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
 
         mTexV->setSize(width, height);
-        mTexV->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
+        mTexV->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt8);
     }
     mTextureAlloced = true;
 }
@@ -214,26 +224,27 @@ void RealTimeRenderer::updateTextureData(const std::shared_ptr<AVFrame> &data) {
               << QVector3D(x1, y2, 0.0f);
 
     QOpenGLPixelTransferOptions options;
+    options.setAlignment(1);
     if (data->linesize[0]) {
         options.setRowLength(data->linesize[0]);
         options.setImageHeight(data->height);
-        mTexY->setData(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8, data->data[0], &options);
+        mTexY->setData(QOpenGLTexture::Red, QOpenGLTexture::UInt8, data->data[0], &options);
     }
     if (data->linesize[1]) {
         if (data->format == AV_PIX_FMT_NV12) {
             options.setRowLength(data->linesize[1] / 2);
             options.setImageHeight(data->height / 2);
-            mTexU->setData(QOpenGLTexture::LuminanceAlpha, QOpenGLTexture::UInt8, data->data[1], &options);
+            mTexU->setData(QOpenGLTexture::RG, QOpenGLTexture::UInt8, data->data[1], &options);
         } else {
             options.setRowLength(data->linesize[1]);
-            options.setImageHeight(data->height);
-            mTexU->setData(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8, data->data[1], &options);
+            options.setImageHeight(data->height / 2);
+            mTexU->setData(QOpenGLTexture::Red, QOpenGLTexture::UInt8, data->data[1], &options);
         }
     }
     if (data->linesize[2]) {
         options.setRowLength(data->linesize[2]);
-        options.setImageHeight(data->height);
-        mTexV->setData(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8, data->data[2], &options);
+        options.setImageHeight(data->height / 2);
+        mTexV->setData(QOpenGLTexture::Red, QOpenGLTexture::UInt8, data->data[2], &options);
     }
 }
 void RealTimeRenderer::paint() {

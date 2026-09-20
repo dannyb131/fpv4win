@@ -42,10 +42,10 @@ jobs:
           git remote add origin https://github.com/microsoft/vcpkg.git
           git fetch origin
           git checkout -b master --track origin/master
-          git checkout b27651341123a59f7187b42ef2bc476284afb310
+          git checkout 04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4
           .\bootstrap-vcpkg.bat
           .\vcpkg integrate install
-          .\vcpkg install libusb libpcap libsodium ffmpeg qt5 sdl2 vcpkg-tool-ninja
+          .\vcpkg install libusb libpcap libsodium "ffmpeg[openssl,srt]" qt5-base qt5-declarative qt5-multimedia qt5-quickcontrols2 sdl2 vcpkg-tool-ninja
           cd ..
           cmake "-DCMAKE_TOOLCHAIN_FILE=D:/a/fpv4win/fpv4win/vcpkg/scripts/buildsystems/vcpkg.cmake" -S ./ -B "build"
           cmake --build build --config Release --target fpv4win

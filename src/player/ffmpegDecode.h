@@ -71,7 +71,9 @@ public:
     // 视频帧格式
     AVPixelFormat GetVideoFrameFormat() const {
         if (isHwDecoderEnable) {
-            return AV_PIX_FMT_NV12;
+            // D3D11 surfaces are downloaded as NV12, then converted to the
+            // renderer's proven planar format in DecodeVideo().
+            return AV_PIX_FMT_YUV420P;
         }
         return pVideoCodecCtx->pix_fmt;
     }
@@ -109,6 +111,8 @@ private:
 
     // 初始化硬件解码器
     bool hwDecoderInit(AVCodecContext *ctx, enum AVHWDeviceType type);
+
+    static enum AVPixelFormat selectHardwareFormat(AVCodecContext *ctx, const enum AVPixelFormat *formats);
 
     // FFmpeg 解封装上下文
     AVFormatContext *pFormatCtx = nullptr;
@@ -167,9 +171,9 @@ private:
     shared_ptr<AVFifo> audioFifoBuffer;
 
     // 硬件解码
-    enum AVHWDeviceType hwDecoderType;
+    enum AVHWDeviceType hwDecoderType = AV_HWDEVICE_TYPE_D3D11VA;
     bool isHwDecoderEnable = false;
-    enum AVPixelFormat hwPixFmt;
+    enum AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
     AVBufferRef *hwDeviceCtx = nullptr;
     volatile bool dropCurrentVideoFrame = false;
     // Hardware frame

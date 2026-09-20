@@ -12,7 +12,8 @@
 
 using namespace std;
 
-Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id, const DataCB &cb)
+Aggregator::Aggregator(
+    const string &keypair, uint64_t epoch, uint32_t channel_id, const DataCB &cb, const LogCB &logCb)
     : fec_p(NULL)
     , fec_k(-1)
     , fec_n(-1)
@@ -29,7 +30,8 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
     , count_p_lost(0)
     , count_p_bad(0)
     , count_p_override(0)
-    , dcb(cb) {
+    , dcb(cb)
+    , logCb(logCb) {
     memset(session_key, '\0', sizeof(session_key));
 
     FILE *fp;
@@ -45,6 +47,12 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
         throw runtime_error(format("Unable to read tx public key: {}", strerror(errno)));
     }
     fclose(fp);
+}
+
+void Aggregator::logOnce(const std::string &key, const std::string &level, const std::string &message) {
+    if (logCb && loggedEvents.insert(key).second) {
+        logCb(level, message);
+    }
 }
 
 Aggregator::~Aggregator() {
@@ -158,13 +166,18 @@ int Aggregator::get_block_ring_idx(uint64_t block_idx) {
 
 void Aggregator::process_packet(
     const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna, const int8_t *rssi) {
-    wsession_data_t new_session_data;
+    uint8_t session_data_buffer[MAX_SESSION_PACKET_SIZE - sizeof(wsession_hdr_t) - crypto_box_MACBYTES] {};
+    auto *new_session_data = reinterpret_cast<wsession_data_t *>(session_data_buffer);
     count_p_all += 1;
 
     if (size == 0)
         return;
 
     if (size > MAX_FORWARDER_PACKET_SIZE) {
+        logOnce(
+            "long-packet", "error",
+            "WFB packet exceeds receiver limit: " + std::to_string(size) + " > "
+                + std::to_string(MAX_FORWARDER_PACKET_SIZE));
         fprintf(stderr, "Long packet (fec payload)\n");
         count_p_bad += 1;
         return;
@@ -180,67 +193,79 @@ void Aggregator::process_packet(
         break;
 
     case WFB_PACKET_KEY:
-        if (size != sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES) {
+        if (size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES
+            || size > MAX_SESSION_PACKET_SIZE) {
+            logOnce("invalid-session-size", "error", "Invalid WFB session packet size: " + std::to_string(size));
             fprintf(stderr, "Invalid session key packet\n");
             count_p_bad += 1;
             return;
         }
 
         if (crypto_box_open_easy(
-                (uint8_t *)&new_session_data, buf + sizeof(wsession_hdr_t),
-                sizeof(wsession_data_t) + crypto_box_MACBYTES, ((wsession_hdr_t *)buf)->session_nonce, tx_publickey,
-                rx_secretkey)
+                session_data_buffer, buf + sizeof(wsession_hdr_t), size - sizeof(wsession_hdr_t),
+                ((wsession_hdr_t *)buf)->session_nonce, tx_publickey, rx_secretkey)
             != 0) {
+            logOnce(
+                "session-decrypt", "error",
+                "Unable to decrypt WFB session; the selected gs.key does not match the transmitter key pair");
             fprintf(stderr, "Unable to decrypt session key\n");
             count_p_dec_err += 1;
             return;
         }
 
-        if (be64toh(new_session_data.epoch) < epoch) {
+        if (be64toh(new_session_data->epoch) < epoch) {
             fprintf(
-                stderr, "Session epoch doesn't match: %" PRIu64 " < %" PRIu64 "\n", be64toh(new_session_data.epoch),
+                stderr, "Session epoch doesn't match: %" PRIu64 " < %" PRIu64 "\n", be64toh(new_session_data->epoch),
                 epoch);
             count_p_dec_err += 1;
             return;
         }
 
-        if (be32toh(new_session_data.channel_id) != channel_id) {
+        if (be32toh(new_session_data->channel_id) != channel_id) {
+            logOnce(
+                "session-channel", "error",
+                "WFB session channel ID mismatch: received " + std::to_string(be32toh(new_session_data->channel_id))
+                    + ", expected " + std::to_string(channel_id));
             fprintf(
-                stderr, "Session channel_id doesn't match: %d != %d\n", be32toh(new_session_data.channel_id),
+                stderr, "Session channel_id doesn't match: %d != %d\n", be32toh(new_session_data->channel_id),
                 channel_id);
             count_p_dec_err += 1;
             return;
         }
 
-        if (new_session_data.fec_type != WFB_FEC_VDM_RS) {
-            fprintf(stderr, "Unsupported FEC codec type: %d\n", new_session_data.fec_type);
+        if (new_session_data->fec_type != WFB_FEC_VDM_RS) {
+            fprintf(stderr, "Unsupported FEC codec type: %d\n", new_session_data->fec_type);
             count_p_dec_err += 1;
             return;
         }
 
-        if (new_session_data.n < 1) {
-            fprintf(stderr, "Invalid FEC N: %d\n", new_session_data.n);
+        if (new_session_data->n < 1) {
+            fprintf(stderr, "Invalid FEC N: %d\n", new_session_data->n);
             count_p_dec_err += 1;
             return;
         }
 
-        if (new_session_data.k < 1 || new_session_data.k > new_session_data.n) {
-            fprintf(stderr, "Invalid FEC K: %d\n", new_session_data.k);
+        if (new_session_data->k < 1 || new_session_data->k > new_session_data->n) {
+            fprintf(stderr, "Invalid FEC K: %d\n", new_session_data->k);
             count_p_dec_err += 1;
             return;
         }
 
         count_p_dec_ok += 1;
 
-        if (memcmp(session_key, new_session_data.session_key, sizeof(session_key)) != 0) {
-            epoch = be64toh(new_session_data.epoch);
-            memcpy(session_key, new_session_data.session_key, sizeof(session_key));
+        if (memcmp(session_key, new_session_data->session_key, sizeof(session_key)) != 0) {
+            epoch = be64toh(new_session_data->epoch);
+            memcpy(session_key, new_session_data->session_key, sizeof(session_key));
 
             if (fec_p != NULL) {
                 deinit_fec();
             }
 
-            init_fec(new_session_data.k, new_session_data.n);
+            init_fec(new_session_data->k, new_session_data->n);
+            logOnce(
+                "session-ready", "info",
+                "WFB session accepted (FEC " + std::to_string(new_session_data->k) + "/"
+                    + std::to_string(new_session_data->n) + ")");
 
             fflush(stdout);
         }
@@ -260,6 +285,7 @@ void Aggregator::process_packet(
             decrypted, &decrypted_len, NULL, buf + sizeof(wblock_hdr_t), size - sizeof(wblock_hdr_t), buf,
             sizeof(wblock_hdr_t), (uint8_t *)(&(block_hdr->data_nonce)), session_key)
         != 0) {
+        logOnce("data-decrypt", "error", "WFB video packet decryption failed after session setup");
         fprintf(stderr, "Unable to decrypt packet #0x%" PRIx64 "\n", be64toh(block_hdr->data_nonce));
         count_p_dec_err += 1;
         return;
