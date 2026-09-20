@@ -48,13 +48,24 @@ file(GLOB_RECURSE SRC_LIST
 list(FILTER SRC_LIST EXCLUDE REGEX ".*/3rd.*/src/main.cpp")
 
 include_directories(src)
-add_executable(${PROJECT_NAME} ${SRC_LIST} qml.qrc)
+if (WIN32)
+    set(APP_ICON_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/fpv4win-icon.rc")
+    file(WRITE "${APP_ICON_RESOURCE}" "IDI_ICON1 ICON DISCARDABLE \"${CMAKE_CURRENT_SOURCE_DIR}/assets/fpv4win.ico\"\n")
+endif ()
+
+add_executable(${PROJECT_NAME} ${SRC_LIST} qml.qrc ${APP_ICON_RESOURCE})
 
 target_link_libraries(${PROJECT_NAME}
         Qt5::Quick ${FFMPEG_LIBRARIES}
         ${SDL2_LIBRARIES}
         ${LIBUSB_LIBRARY} devourer
         unofficial-sodium::sodium)
+
+if (WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${PROJECT_NAME} PRIVATE /FIwinsock2.h)
+    target_link_libraries(${PROJECT_NAME} ws2_32)
+endif ()
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${LIBUSB_INCLUDE_DIR})
 

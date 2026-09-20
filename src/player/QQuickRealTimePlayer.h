@@ -98,6 +98,9 @@ protected:
     shared_ptr<Mp4Encoder> _mp4Encoder;
     // 网络推流器
     shared_ptr<StreamPublisher> _streamPublisher;
+    // Codec headers plus the first random-access frame, retained so a
+    // streaming client can start after the local decoder is already running.
+    shared_ptr<AVPacket> _streamBootstrapPacket;
     // 保护录制器和推流器；解码回调在后台线程运行
     mutex outputMutex;
     // GIF录制器

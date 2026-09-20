@@ -400,12 +400,28 @@ void WFBReceiver::telemetryLoop() {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     local.sin_port = htons(14551);
     if (bind(static_cast<SOCKET>(telemetryFd), reinterpret_cast<sockaddr *>(&local), sizeof(local)) == SOCKET_ERROR) {
+        // Mission Planner can retain 14551 after reconnecting or when more
+        // than one UDP connection is configured.  Binding an ephemeral port
+        // is safe: telemetry sent to Mission Planner originates from this
+        // same socket, so Mission Planner returns packets to the actual
+        // source port automatically.
+        local.sin_port = 0;
+        if (bind(static_cast<SOCKET>(telemetryFd), reinterpret_cast<sockaddr *>(&local), sizeof(local))
+            == SOCKET_ERROR) {
+            QmlNativeAPI::Instance().PutLog(
+                "error", "Unable to bind any local port for the MAVLink bridge");
+            closesocket(static_cast<SOCKET>(telemetryFd));
+            telemetryFd = INVALID_SOCKET;
+            telemetryRunning = false;
+            return;
+        }
+        sockaddr_in actualLocal {};
+        int actualLocalSize = sizeof(actualLocal);
+        getsockname(
+            static_cast<SOCKET>(telemetryFd), reinterpret_cast<sockaddr *>(&actualLocal), &actualLocalSize);
         QmlNativeAPI::Instance().PutLog(
-            "error", "Unable to bind MAVLink reply port 14551; close any other telemetry bridge using it");
-        closesocket(static_cast<SOCKET>(telemetryFd));
-        telemetryFd = INVALID_SOCKET;
-        telemetryRunning = false;
-        return;
+            "warn", "MAVLink reply port 14551 is already in use; using automatic port "
+                + std::to_string(ntohs(actualLocal.sin_port)) + " instead");
     }
     DWORD timeoutMs = 250;
     setsockopt(

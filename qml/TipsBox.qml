@@ -1,43 +1,48 @@
-import QtQuick 2.12
-import QtQuick.Controls 2.5
+import QtQuick 2.15
+import QtQuick.Controls 2.15
 
-Rectangle{
-    id:tipsBox
+Rectangle {
+    id: tipsBox
     visible: false
-    color:"#bb333333"
-    width:childrenRect.width
-    height:childrenRect.height
-    anchors.verticalCenter: parent.verticalCenter
-    anchors.horizontalCenter: parent.horizontalCenter
-    property string tips: ''
-    property var timeout: 3000
-    radius: 5
-    property var showPop : function(msg,time){
-        tips = msg;
-        hideTimer.interval = time?time:timeout
-        tipsBox.visible = true;
-        hideTimer.restart();
+    width: Math.min(messageText.implicitWidth + 36, parent ? parent.width - 48 : 520)
+    height: messageText.implicitHeight + 24
+    anchors.centerIn: parent
+    radius: 10
+    color: "#F01A293B"
+    border.color: "#3B536F"
+    border.width: 1
+
+    property string tips: ""
+    property int timeout: 3000
+
+    function showPop(message, duration) {
+        tips = message
+        hideTimer.interval = duration || timeout
+        visible = true
+        hideTimer.restart()
     }
-    property var hide : function(){
-        tipsBox.visible = false;
-        tipsBox.tips = ""
-        hideTimer.stop();
+
+    function hide() {
+        visible = false
+        tips = ""
+        hideTimer.stop()
     }
+
     Timer {
-        id:hideTimer
-        interval: tipsBox.timeout;
-        running: false;
-        repeat: false;
-        onTriggered: ()=>{
-            tipsBox.hide();
-        }
-     }
+        id: hideTimer
+        interval: tipsBox.timeout
+        repeat: false
+        onTriggered: tipsBox.hide()
+    }
+
     Text {
-        padding: 10
-        anchors.verticalCenter: parent.verticalCenter
-        anchors.horizontalCenter: parent.horizontalCenter
+        id: messageText
+        anchors.centerIn: parent
+        width: tipsBox.width - 32
         text: tipsBox.tips
-        font.pointSize: 16
-        color: "#ffffff"
+        color: "#F2F7FF"
+        font.pixelSize: 13
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
     }
 }

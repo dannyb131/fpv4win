@@ -7,9 +7,59 @@
 #include <QQuickWindow>
 #include <QStandardPaths>
 #include <SDL2/SDL.h>
+#include <algorithm>
+#include <cstring>
 #include <future>
 #include <libavutil/pixdesc.h>
 #include <sstream>
+
+namespace {
+bool containsRandomAccessNal(const AVPacket *packet, AVCodecID codec) {
+    if (!packet || !packet->data || packet->size < 5) {
+        return false;
+    }
+    for (int i = 0; i + 4 < packet->size; ++i) {
+        int nalOffset = -1;
+        if (packet->data[i] == 0 && packet->data[i + 1] == 0 && packet->data[i + 2] == 1) {
+            nalOffset = i + 3;
+        } else if (i + 5 < packet->size && packet->data[i] == 0 && packet->data[i + 1] == 0
+                   && packet->data[i + 2] == 0 && packet->data[i + 3] == 1) {
+            nalOffset = i + 4;
+        }
+        if (nalOffset < 0) {
+            continue;
+        }
+        if (codec == AV_CODEC_ID_HEVC) {
+            const int type = (packet->data[nalOffset] >> 1) & 0x3f;
+            if (type >= 16 && type <= 21) {
+                return true;
+            }
+        } else if (codec == AV_CODEC_ID_H264 && (packet->data[nalOffset] & 0x1f) == 5) {
+            return true;
+        }
+    }
+    return false;
+}
+
+shared_ptr<AVPacket> makeBootstrapPacket(const AVPacket *packet, const AVCodecParameters *parameters) {
+    if (!packet || !parameters || !containsRandomAccessNal(packet, parameters->codec_id)) {
+        return {};
+    }
+    const int extraSize = std::max(0, parameters->extradata_size);
+    auto result = shared_ptr<AVPacket>(av_packet_alloc(), [](AVPacket *value) { av_packet_free(&value); });
+    if (!result || av_new_packet(result.get(), extraSize + packet->size) < 0) {
+        return {};
+    }
+    if (extraSize > 0) {
+        std::memcpy(result->data, parameters->extradata, extraSize);
+    }
+    std::memcpy(result->data + extraSize, packet->data, packet->size);
+    av_packet_copy_props(result.get(), packet);
+    result->stream_index = packet->stream_index;
+    result->flags |= AV_PKT_FLAG_KEY;
+    return result;
+}
+}
 // GIF默认帧率
 #define DEFAULT_GIF_FRAMERATE 10
 
@@ -136,6 +186,10 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
             return;
         }
         decoder = decoder_;
+        {
+            lock_guard<mutex> lock(outputMutex);
+            _streamBootstrapPacket.reset();
+        }
         if (decoder->HasVideo()) {
             QmlNativeAPI::Instance().PutLog(
                 "info", "FFmpeg opened " + std::string(avcodec_get_name(decoder->pVideoCodecCtx->codec_id))
@@ -146,6 +200,15 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
         }
         decoder->_gotPktCallback = [this](const shared_ptr<AVPacket> &packet) {
             lock_guard<mutex> lock(outputMutex);
+            if (!_streamBootstrapPacket && packet->stream_index == decoder->videoStreamIndex) {
+                AVStream *stream = decoder->pFormatCtx->streams[decoder->videoStreamIndex];
+                _streamBootstrapPacket = makeBootstrapPacket(packet.get(), stream->codecpar);
+                if (_streamBootstrapPacket) {
+                    QmlNativeAPI::Instance().PutLog(
+                        "info", "Cached H.265 stream bootstrap: codec headers plus random-access frame ("
+                            + std::to_string(_streamBootstrapPacket->size) + " bytes)");
+                }
+            }
             if (_mp4Encoder) {
                 _mp4Encoder->writePacket(packet, packet->stream_index == decoder->videoStreamIndex);
             }
@@ -331,6 +394,15 @@ QString QQuickRealTimePlayer::startStream(const QString &streamUrl) {
 
     const std::string target = streamUrl.trimmed().toStdString();
     auto publisher = make_shared<StreamPublisher>(target);
+    if (decoder->HasVideo()) {
+        AVStream *videoStream = decoder->pFormatCtx->streams[decoder->videoStreamIndex];
+        QmlNativeAPI::Instance().PutLog(
+            "info", "Starting stream output " + target + "; codec "
+                + std::string(avcodec_get_name(videoStream->codecpar->codec_id)) + ", time base "
+                + std::to_string(videoStream->time_base.num) + "/"
+                + std::to_string(videoStream->time_base.den) + ", extradata "
+                + std::to_string(videoStream->codecpar->extradata_size) + " bytes");
+    }
     if (decoder->HasAudio()
         && !publisher->addTrack(decoder->pFormatCtx->streams[decoder->audioStreamIndex])) {
         return QString::fromStdString(publisher->lastError());
@@ -339,7 +411,13 @@ QString QQuickRealTimePlayer::startStream(const QString &streamUrl) {
         && !publisher->addTrack(decoder->pFormatCtx->streams[decoder->videoStreamIndex])) {
         return QString::fromStdString(publisher->lastError());
     }
-    publisher->onError = [this](const std::string &error) { emit onStreamStopped(QString::fromStdString(error)); };
+    publisher->onStatus = [](const std::string &status) {
+        QmlNativeAPI::Instance().PutLog("info", status);
+    };
+    publisher->onError = [this](const std::string &error) {
+        QmlNativeAPI::Instance().PutLog("error", error);
+        emit onStreamStopped(QString::fromStdString(error));
+    };
     if (!publisher->start()) {
         return QString::fromStdString(publisher->lastError());
     }
@@ -347,6 +425,13 @@ QString QQuickRealTimePlayer::startStream(const QString &streamUrl) {
         lock_guard<mutex> lock(outputMutex);
         if (_streamPublisher) {
             _streamPublisher->stop();
+        }
+        if (_streamBootstrapPacket) {
+            publisher->enqueuePacket(_streamBootstrapPacket);
+            QmlNativeAPI::Instance().PutLog("info", "Injected cached codec headers and random-access frame");
+        } else {
+            QmlNativeAPI::Instance().PutLog(
+                "error", "No cached random-access frame is available yet; restart the receiver before streaming");
         }
         _streamPublisher = std::move(publisher);
     }

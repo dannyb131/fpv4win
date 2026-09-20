@@ -1,5 +1,6 @@
 ﻿#include "src/QmlNativeAPI.h"
 #include <QGuiApplication>
+#include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <player/QQuickRealTimePlayer.h>
@@ -38,6 +39,8 @@ int main(int argc, char *argv[]) {
 #endif
 
     QGuiApplication app(argc, argv);
+    app.setApplicationDisplayName(QStringLiteral("fpv4win"));
+    app.setWindowIcon(QIcon(QStringLiteral(":/assets/fpv4win.png")));
 
     QQmlApplicationEngine engine;
 

@@ -12,6 +12,20 @@ This fork updates the receiver for current OpenIPC FPV firmware and adds:
 - Bidirectional MAVLink telemetry for Mission Planner.
 - Project-local Windows build dependencies and removal scripts.
 
+![fpv4win modern interface](docs/images/fpv4win-modern-ui.png)
+
+### Download for Windows
+
+Download the latest ready-to-run Windows x64 package from the
+[GitHub Releases page](https://github.com/dannyb131/fpv4win/releases/latest).
+Extract the ZIP, connect the RTL8812AU adapter configured with Zadig/WinUSB,
+and run `fpv4win.exe`. The package includes the required Qt and FFmpeg runtime
+files, so a compiler is not needed.
+
+The interface includes help beside each radio setting, working presets for VLC
+and Mission Planner streaming, link-stage counters, MAVLink status, and a
+selectable activity log for troubleshooting.
+
 
 - [devourer](https://github.com/openipc/devourer): A userspace rtl8812au driver initially created by [buldo](https://github.com/buldo) and converted to C by [josephnef](https://github.com/josephnef) .
 - [wfb-ng](https://github.com/svpcom/wfb-ng): A library that allows broadcasting the video feed over the air.

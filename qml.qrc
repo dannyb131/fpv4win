@@ -1,7 +1,9 @@
 <RCC>
     <qresource prefix="/">
         <file>qml/main.qml</file>
+        <file>qml/SettingHelp.qml</file>
         <file>qml/TipsBox.qml</file>
         <file>qml/RecordTimer.qml</file>
+        <file>assets/fpv4win.png</file>
     </qresource>
 </RCC> 

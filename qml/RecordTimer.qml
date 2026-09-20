@@ -1,59 +1,59 @@
-import QtQuick 2.12
-import QtQuick.Controls 2.5
-Rectangle{
-    id:recordTimer
+import QtQuick 2.15
+
+Rectangle {
+    id: recordTimer
     visible: false
-    property var startTime: 0
-    property var recordLen: 0
-    color:"#bb333333"
-    width:childrenRect.width
-    height:childrenRect.height
-    radius: 5
-    z:999
-    Text {
-        width:20
-        id:redCyc
-        visible: false
-        padding: 5
-        anchors.verticalCenter: parent.verticalCenter
-        anchors.right: time.left + 16
-        text: '<font color="#ff0000" >●</font>'
-        font.pixelSize: 16
-        Timer {
-           interval: 1000;
-           running: true;
-           repeat: true;
-           onTriggered: ()=>{
-                redCyc.visible = !redCyc.visible
-           }
+    width: 72
+    height: 30
+    radius: 7
+    color: "#D91D2939"
+    border.color: "#5A708D"
+
+    property double startTime: 0
+    property double recordLen: 0
+
+    Row {
+        anchors.centerIn: parent
+        spacing: 6
+        Text {
+            id: recordDot
+            text: "●"
+            color: "#FB7185"
+            font.pixelSize: 12
+        }
+        Text {
+            text: Math.floor(recordTimer.recordLen) + "s"
+            color: "#FFFFFF"
+            font.pixelSize: 12
+            font.weight: Font.DemiBold
         }
     }
-    Text {
-        width:parent.width-20
-        id:time
-        padding: 5
-        anchors.verticalCenter: parent.verticalCenter
-        anchors.right: parent.right
-        text:parseInt(recordTimer.recordLen) + 'S'
-        font.pixelSize: 12
-        color: "#ffffff"
-    }
+
     Timer {
-       id:timer
-       interval: 100;
-       running: false;
-       repeat: true;
-       onTriggered: ()=>{
-            recordTimer.recordLen = (new Date().getTime() - startTime)/1000;
-       }
+        id: pulseTimer
+        interval: 600
+        running: recordTimer.visible
+        repeat: true
+        onTriggered: recordDot.visible = !recordDot.visible
     }
-    property var start :function(){
-        recordTimer.visible = true;
-        recordTimer.startTime = new Date().getTime();
-        timer.start();
+
+    Timer {
+        id: elapsedTimer
+        interval: 100
+        repeat: true
+        onTriggered: recordTimer.recordLen = (new Date().getTime() - recordTimer.startTime) / 1000
     }
-    property var stop :function(){
-        recordTimer.visible = false;
-        timer.stop();
+
+    function start() {
+        visible = true
+        startTime = new Date().getTime()
+        recordLen = 0
+        elapsedTimer.start()
+    }
+
+    function stop() {
+        visible = false
+        elapsedTimer.stop()
+        recordDot.visible = true
     }
 }
