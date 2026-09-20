@@ -58,6 +58,56 @@ Open `http://<computer-LAN-IP>:8080/stream.ts` in VLC on another device. Start t
 
 Publishing to an existing RTMP/RTMPS, RTSP/RTSPS, SRT, or MPEG-TS-over-UDP endpoint remains supported. The encoded camera packets are remuxed rather than re-encoded, keeping latency and CPU usage low. MP4 recording and server streaming can be used at the same time.
 
+#### VLC connection strings
+
+In fpv4win, select the **VLC / network** preset or enter this as the stream
+destination, then select **START STREAM**:
+
+```text
+http://0.0.0.0:8080/stream.ts
+```
+
+In VLC, select **Media > Open Network Stream** and enter the following address
+when VLC is running on the same computer:
+
+```text
+http://127.0.0.1:8080/stream.ts
+```
+
+For VLC on another device, replace `<computer-LAN-IP>` with the IPv4 address of
+the computer running fpv4win:
+
+```text
+http://<computer-LAN-IP>:8080/stream.ts
+```
+
+Enter only the address shown inside the code block; do not include Markdown
+brackets or parentheses. Start the fpv4win receiver, wait for live video, start
+the stream server, and then open the address in VLC.
+
+#### Mission Planner video connection strings
+
+In fpv4win, select the **Mission Planner** preset or use this stream destination:
+
+```text
+udp://127.0.0.1:5601?pkt_size=1316
+```
+
+For an H.265 camera, use this GStreamer pipeline in Mission Planner:
+
+```text
+udpsrc port=5601 buffer-size=90000 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" ! tsdemux ! h265parse config-interval=-1 ! avdec_h265 max-threads=1 ! queue max-size-buffers=1 leaky=2 ! videoconvert ! video/x-raw,format=BGRA ! appsink name=outsink sync=false
+```
+
+For an H.264 camera, use:
+
+```text
+udpsrc port=5601 buffer-size=90000 caps="video/mpegts,systemstream=(boolean)true,packetsize=(int)188" ! tsdemux ! h264parse config-interval=-1 ! avdec_h264 max-threads=1 ! queue max-size-buffers=1 leaky=2 ! videoconvert ! video/x-raw,format=BGRA ! appsink name=outsink sync=false
+```
+
+These pipelines use the software decoder included with Mission Planner's older
+GStreamer runtime and keep only the newest queued frame to reduce latency.
+
 ### Mission Planner telemetry
 
 fpv4win bridges the standard OpenIPC MAVLink WFB streams in both directions:
