@@ -118,4 +118,18 @@ if (BUILD_TESTING)
     target_include_directories(wfb_roundtrip_test PRIVATE src src/wifi)
     target_link_libraries(wfb_roundtrip_test PRIVATE Qt5::Core unofficial-sodium::sodium)
     add_test(NAME wfb_roundtrip COMMAND wfb_roundtrip_test)
+
+    add_executable(jpeg_encoder_test
+            tests/JpegEncoderTest.cpp
+            src/player/JpegEncoder.cpp)
+    target_include_directories(jpeg_encoder_test PRIVATE src ${FFMPEG_INCLUDE_DIRS})
+    target_link_libraries(jpeg_encoder_test PRIVATE Qt5::Gui ${FFMPEG_LIBRARIES})
+    add_test(NAME jpeg_encoder COMMAND jpeg_encoder_test)
+
+    add_executable(mp4_encoder_test
+            tests/Mp4EncoderTest.cpp
+            src/player/Mp4Encoder.cpp)
+    target_include_directories(mp4_encoder_test PRIVATE src ${FFMPEG_INCLUDE_DIRS})
+    target_link_libraries(mp4_encoder_test PRIVATE ${FFMPEG_LIBRARIES})
+    add_test(NAME mp4_encoder COMMAND mp4_encoder_test)
 endif ()

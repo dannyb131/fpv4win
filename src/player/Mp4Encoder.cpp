@@ -1,16 +1,102 @@
-﻿//
-// Created by liangzhuohua on 2022/3/1.
-//
-
 #include "Mp4Encoder.h"
 
-Mp4Encoder::Mp4Encoder(const string &saveFilePath) {
-    // 分配
-    _formatCtx = shared_ptr<AVFormatContext>(avformat_alloc_context(), &avformat_free_context);
-    // 设置格式
-    _formatCtx->oformat = av_guess_format("mov", nullptr, nullptr);
-    // 文件保存路径
-    _saveFilePath = saveFilePath;
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
+namespace {
+struct NalUnit {
+    const uint8_t *data = nullptr;
+    size_t size = 0;
+};
+
+std::vector<NalUnit> annexBNalUnits(const AVPacket *packet) {
+    std::vector<NalUnit> units;
+    if (!packet || !packet->data || packet->size < 4) {
+        return units;
+    }
+
+    auto startCodeLength = [packet](size_t offset) -> size_t {
+        if (offset + 3 <= static_cast<size_t>(packet->size)
+            && packet->data[offset] == 0 && packet->data[offset + 1] == 0 && packet->data[offset + 2] == 1) {
+            return 3;
+        }
+        if (offset + 4 <= static_cast<size_t>(packet->size)
+            && packet->data[offset] == 0 && packet->data[offset + 1] == 0
+            && packet->data[offset + 2] == 0 && packet->data[offset + 3] == 1) {
+            return 4;
+        }
+        return 0;
+    };
+
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(packet->size)) {
+        size_t codeLength = 0;
+        while (offset < static_cast<size_t>(packet->size)
+               && (codeLength = startCodeLength(offset)) == 0) {
+            ++offset;
+        }
+        if (!codeLength) {
+            break;
+        }
+        const size_t nalStart = offset + codeLength;
+        size_t nalEnd = nalStart;
+        while (nalEnd < static_cast<size_t>(packet->size) && startCodeLength(nalEnd) == 0) {
+            ++nalEnd;
+        }
+        if (nalEnd > nalStart) {
+            units.push_back({ packet->data + nalStart, nalEnd - nalStart });
+        }
+        offset = nalEnd;
+    }
+    return units;
+}
+
+bool isParameterSet(const NalUnit &unit, AVCodecID codec) {
+    if (!unit.data || unit.size == 0) {
+        return false;
+    }
+    if (codec == AV_CODEC_ID_HEVC) {
+        const int type = (unit.data[0] >> 1) & 0x3f;
+        return type == 32 || type == 33 || type == 34;
+    }
+    if (codec == AV_CODEC_ID_H264) {
+        const int type = unit.data[0] & 0x1f;
+        return type == 7 || type == 8;
+    }
+    return false;
+}
+
+bool isRandomAccessPacket(const AVPacket *packet, AVCodecID codec) {
+    if (!packet) {
+        return false;
+    }
+    if (packet->flags & AV_PKT_FLAG_KEY) {
+        return true;
+    }
+    for (const NalUnit &unit : annexBNalUnits(packet)) {
+        if (codec == AV_CODEC_ID_HEVC) {
+            const int type = (unit.data[0] >> 1) & 0x3f;
+            if (type >= 16 && type <= 21) {
+                return true;
+            }
+        } else if (codec == AV_CODEC_ID_H264 && (unit.data[0] & 0x1f) == 5) {
+            return true;
+        }
+    }
+    return false;
+}
+}
+
+Mp4Encoder::Mp4Encoder(const string &saveFilePath)
+    : _saveFilePath(saveFilePath) {
+    AVFormatContext *context = nullptr;
+    const int result = avformat_alloc_output_context2(&context, nullptr, "mp4", _saveFilePath.c_str());
+    if (result >= 0 && context) {
+        _formatCtx = shared_ptr<AVFormatContext>(context, &avformat_free_context);
+    } else {
+        fail(result < 0 ? result : AVERROR_UNKNOWN, "Unable to create MP4 output");
+    }
 }
 
 Mp4Encoder::~Mp4Encoder() {
@@ -19,78 +105,185 @@ Mp4Encoder::~Mp4Encoder() {
     }
 }
 
-void Mp4Encoder::addTrack(AVStream *stream) {
-    AVStream *os = avformat_new_stream(_formatCtx.get(), nullptr);
-    if (!os) {
-        return;
+bool Mp4Encoder::addTrack(AVStream *stream, const AVCodecContext *codecContext) {
+    if (!_formatCtx || !stream) {
+        _lastError = "The source track is not available.";
+        return false;
     }
-    int ret = avcodec_parameters_copy(os->codecpar, stream->codecpar);
-    if (ret < 0) {
-        return;
+
+    AVStream *output = avformat_new_stream(_formatCtx.get(), nullptr);
+    if (!output) {
+        _lastError = "Unable to allocate an MP4 track.";
+        return false;
     }
-    os->codecpar->codec_tag = 0;
-    if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        audioIndex = os->index;
+
+    int result = codecContext
+        ? avcodec_parameters_from_context(output->codecpar, codecContext)
+        : avcodec_parameters_copy(output->codecpar, stream->codecpar);
+    if (result < 0) {
+        return fail(result, "Unable to copy MP4 track parameters");
+    }
+    output->codecpar->codec_tag = 0;
+    output->time_base = stream->time_base;
+
+    if (output->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        audioIndex = output->index;
         _originAudioTimeBase = stream->time_base;
-    } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        videoIndex = os->index;
+    } else if (output->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        videoIndex = output->index;
         _originVideoTimeBase = stream->time_base;
+        _videoCodecId = output->codecpar->codec_id;
     }
+    return true;
+}
+
+bool Mp4Encoder::primeVideoParameters(const AVPacket *packet) {
+    if (!_formatCtx || videoIndex < 0 || !packet) {
+        _lastError = "No video keyframe is available yet.";
+        return false;
+    }
+
+    AVCodecParameters *parameters = _formatCtx->streams[videoIndex]->codecpar;
+    std::vector<uint8_t> extraData;
+    static constexpr uint8_t startCode[] = { 0, 0, 0, 1 };
+    for (const NalUnit &unit : annexBNalUnits(packet)) {
+        if (!isParameterSet(unit, _videoCodecId)) {
+            continue;
+        }
+        extraData.insert(extraData.end(), std::begin(startCode), std::end(startCode));
+        extraData.insert(extraData.end(), unit.data, unit.data + unit.size);
+    }
+
+    if (!extraData.empty()) {
+        av_freep(&parameters->extradata);
+        parameters->extradata = static_cast<uint8_t *>(
+            av_mallocz(extraData.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!parameters->extradata) {
+            return fail(AVERROR(ENOMEM), "Unable to allocate MP4 codec headers");
+        }
+        std::memcpy(parameters->extradata, extraData.data(), extraData.size());
+        parameters->extradata_size = static_cast<int>(extraData.size());
+    }
+
+    if ((_videoCodecId == AV_CODEC_ID_H264 || _videoCodecId == AV_CODEC_ID_HEVC)
+        && parameters->extradata_size == 0) {
+        _lastError = "The next camera keyframe has not supplied codec headers yet.";
+        return false;
+    }
+    return true;
 }
 
 bool Mp4Encoder::start() {
-    // 初始化上下文
-    if (avio_open(&_formatCtx->pb, _saveFilePath.c_str(), AVIO_FLAG_READ_WRITE) < 0) {
+    if (!_formatCtx || videoIndex < 0) {
+        _lastError = "No video track is available for MP4 recording.";
         return false;
     }
-    // 写输出流头信息
-    AVDictionary *opts = nullptr;
-    av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov", 0);
-    int ret = avformat_write_header(_formatCtx.get(), &opts);
-    av_dict_free(&opts);
-    if (ret < 0) {
-        avio_closep(&_formatCtx->pb);
+    AVCodecParameters *videoParameters = _formatCtx->streams[videoIndex]->codecpar;
+    if (videoParameters->width <= 0 || videoParameters->height <= 0) {
+        _lastError = "The video dimensions are not available yet.";
         return false;
+    }
+
+    int result = avio_open(&_formatCtx->pb, _saveFilePath.c_str(), AVIO_FLAG_WRITE);
+    if (result < 0) {
+        return fail(result, "Unable to create the MP4 file");
+    }
+
+    AVDictionary *options = nullptr;
+    av_dict_set(&options, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+    av_dict_set(&options, "avoid_negative_ts", "make_zero", 0);
+    result = avformat_write_header(_formatCtx.get(), &options);
+    av_dict_free(&options);
+    if (result < 0) {
+        avio_closep(&_formatCtx->pb);
+        return fail(result, "Unable to write the MP4 header");
     }
     _isOpen = true;
     return true;
 }
 
-void Mp4Encoder::writePacket(const shared_ptr<AVPacket> &pkt, bool isVideo) {
-    if (!_isOpen) {
+void Mp4Encoder::writePacket(const shared_ptr<AVPacket> &packet, bool isVideo) {
+    if (!_isOpen || !packet) {
         return;
     }
-    shared_ptr<AVPacket> outputPacket(
-        av_packet_clone(pkt.get()), [](AVPacket *packet) { av_packet_free(&packet); });
-    if (!outputPacket) {
+
+    auto output = shared_ptr<AVPacket>(
+        av_packet_clone(packet.get()), [](AVPacket *value) { av_packet_free(&value); });
+    if (!output) {
         return;
     }
-#ifdef I_FRAME_FIRST
-    // 未获取视频关键帧前先忽略音频
-    if (videoIndex >= 0 && !writtenKeyFrame && !isVideo) {
+
+    if (!writtenKeyFrame) {
+        if (!isVideo || !isRandomAccessPacket(output.get(), _videoCodecId)) {
+            return;
+        }
+        output->flags |= AV_PKT_FLAG_KEY;
+        writtenKeyFrame = true;
+    } else if (isVideo && isRandomAccessPacket(output.get(), _videoCodecId)) {
+        output->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    const int outputIndex = isVideo ? videoIndex : audioIndex;
+    if (outputIndex < 0) {
         return;
     }
-    // 跳过非关键帧，使关键帧前置
-    if (!writtenKeyFrame && !(outputPacket->flags & AV_PKT_FLAG_KEY)) {
+    const AVRational inputTimeBase = isVideo ? _originVideoTimeBase : _originAudioTimeBase;
+    int64_t &firstTimestamp = isVideo ? _videoFirstTimestamp : _audioFirstTimestamp;
+    int64_t &lastDts = isVideo ? _videoLastDts : _audioLastDts;
+    const int64_t sourceTimestamp = output->dts != AV_NOPTS_VALUE ? output->dts : output->pts;
+    if (firstTimestamp == AV_NOPTS_VALUE && sourceTimestamp != AV_NOPTS_VALUE) {
+        firstTimestamp = sourceTimestamp;
+    }
+    if (firstTimestamp != AV_NOPTS_VALUE) {
+        if (output->dts != AV_NOPTS_VALUE) output->dts -= firstTimestamp;
+        if (output->pts != AV_NOPTS_VALUE) output->pts -= firstTimestamp;
+    }
+
+    output->stream_index = outputIndex;
+    output->pos = -1;
+    av_packet_rescale_ts(output.get(), inputTimeBase, _formatCtx->streams[outputIndex]->time_base);
+    if (output->dts == AV_NOPTS_VALUE) {
+        output->dts = lastDts == AV_NOPTS_VALUE ? 0 : lastDts + std::max<int64_t>(output->duration, 1);
+    }
+    if (lastDts != AV_NOPTS_VALUE && output->dts <= lastDts) {
+        output->dts = lastDts + std::max<int64_t>(output->duration, 1);
+    }
+    if (output->pts == AV_NOPTS_VALUE || output->pts < output->dts) {
+        output->pts = output->dts;
+    }
+    lastDts = output->dts;
+
+    const int result = av_interleaved_write_frame(_formatCtx.get(), output.get());
+    if (result < 0) {
+        fail(result, "Unable to write MP4 video data");
         return;
     }
-    writtenKeyFrame = true;
-#endif
-    if (isVideo) {
-        outputPacket->stream_index = videoIndex;
-        av_packet_rescale_ts(outputPacket.get(), _originVideoTimeBase, _formatCtx->streams[videoIndex]->time_base);
-    } else {
-        outputPacket->stream_index = audioIndex;
-        av_packet_rescale_ts(outputPacket.get(), _originAudioTimeBase, _formatCtx->streams[audioIndex]->time_base);
-    }
-    outputPacket->pos = -1;
-    av_write_frame(_formatCtx.get(), outputPacket.get());
+    _wrotePacket = true;
 }
 
-void Mp4Encoder::stop() {
+bool Mp4Encoder::stop() {
+    if (!_isOpen) {
+        return false;
+    }
+    const int trailerResult = av_write_trailer(_formatCtx.get());
+    const int closeResult = avio_closep(&_formatCtx->pb);
     _isOpen = false;
-    // 写文件尾
-    av_write_trailer(_formatCtx.get());
-    // 关闭文件
-    avio_closep(&_formatCtx->pb);
+    if (!_wrotePacket) {
+        _lastError = "Recording stopped before the camera sent a new keyframe.";
+        return false;
+    }
+    if (trailerResult < 0) {
+        return fail(trailerResult, "Unable to finish the MP4 file");
+    }
+    if (closeResult < 0) {
+        return fail(closeResult, "Unable to close the MP4 file");
+    }
+    return true;
+}
+
+bool Mp4Encoder::fail(int errorCode, const string &context) {
+    char error[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(errorCode, error, sizeof(error));
+    _lastError = context + ": " + error;
+    return false;
 }

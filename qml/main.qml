@@ -16,6 +16,7 @@ ApplicationWindow {
 
     property bool receiverRunning: false
     property bool videoActive: false
+    property bool controlsVisible: true
     property string bitrateText: "Waiting for video"
 
     palette.window: "#08111F"
@@ -42,6 +43,11 @@ ApplicationWindow {
     }
 
     TipsBox { id: tips; z: 1000; tips: "" }
+
+    Shortcut {
+        sequence: "Ctrl+Shift+M"
+        onActivated: window.controlsVisible = !window.controlsVisible
+    }
 
     Rectangle {
         id: header
@@ -72,6 +78,14 @@ ApplicationWindow {
                 spacing: 2
                 Text { text: "fpv4win"; color: "#F7FAFF"; font.pixelSize: 20; font.weight: Font.Bold }
                 Text { text: "OpenIPC video and telemetry ground station"; color: "#7F91AA"; font.pixelSize: 11 }
+            }
+            Button {
+                id: controlsToggle
+                text: window.controlsVisible ? "Hide controls" : "Show controls"
+                font.pixelSize: 11
+                ToolTip.visible: hovered
+                ToolTip.text: "Collapse or restore the setup and monitor panel (Ctrl+Shift+M)."
+                onClicked: window.controlsVisible = !window.controlsVisible
             }
             Rectangle {
                 Layout.preferredWidth: statusText.implicitWidth + 28
@@ -233,8 +247,9 @@ ApplicationWindow {
 
         Rectangle {
             id: sidePanel
-            Layout.preferredWidth: Math.min(390, window.width * 0.36)
-            Layout.minimumWidth: 340
+            visible: window.controlsVisible
+            Layout.preferredWidth: window.controlsVisible ? Math.min(390, window.width * 0.36) : 0
+            Layout.minimumWidth: window.controlsVisible ? 340 : 0
             Layout.fillHeight: true
             radius: 12
             color: "#0D1828"

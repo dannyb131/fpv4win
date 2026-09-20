@@ -3,6 +3,8 @@
 #include "JpegEncoder.h"
 #include "QmlNativeAPI.h"
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QOpenGLFramebufferObject>
 #include <QQuickWindow>
 #include <QStandardPaths>
@@ -144,9 +146,9 @@ shared_ptr<AVFrame> QQuickRealTimePlayer::getFrame(bool &got) {
         got = true;
         // 缓冲区出队被渲染的帧
         videoFrameQueue.pop();
+        // Keep the last rendered frame under the same lock used by captureJpeg().
+        _lastFrame = frame;
     }
-    // 缓冲，追帧机制
-    _lastFrame = frame;
     return frame;
 }
 
@@ -323,56 +325,90 @@ QQuickRealTimePlayer::~QQuickRealTimePlayer() {
 }
 
 QString QQuickRealTimePlayer::captureJpeg() {
-    if (!_lastFrame) {
+    shared_ptr<AVFrame> frame;
+    {
+        lock_guard<mutex> lock(mtx);
+        frame = _lastFrame;
+    }
+    if (!frame) {
+        QmlNativeAPI::Instance().PutLog("error", "JPEG capture failed: no decoded frame is available yet");
         return "";
     }
-    QString dirPath = QFileInfo("jpg/l").absolutePath();
-    QDir dir(dirPath);
-    if (!dir.exists()) {
-        dir.mkpath(dirPath);
+
+    QDir outputDirectory(QDir::current().filePath("jpg"));
+    if (!outputDirectory.exists() && !QDir().mkpath(outputDirectory.absolutePath())) {
+        QmlNativeAPI::Instance().PutLog("error", "JPEG capture failed: unable to create the jpg folder");
+        return "";
     }
-    stringstream ss;
-    ss << "jpg/";
-    ss << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-              .count()
-       << ".jpg";
-    auto ok = JpegEncoder::encodeJpeg(ss.str(), _lastFrame);
-    // 截图
-    return ok ? QString(ss.str().c_str()) : "";
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const QString filePath = outputDirectory.filePath(QString::number(timestamp) + ".jpg");
+    const bool ok = JpegEncoder::encodeJpeg(filePath.toStdString(), frame);
+    if (!ok) {
+        QFile::remove(filePath);
+        QmlNativeAPI::Instance().PutLog(
+            "error", "JPEG capture failed while encoding " + filePath.toStdString());
+        return "";
+    }
+    QmlNativeAPI::Instance().PutLog("info", "Saved JPEG capture to " + filePath.toStdString());
+    return QDir::toNativeSeparators(filePath);
 }
 
 bool QQuickRealTimePlayer::startRecord() {
-    if (playStop && !_lastFrame) {
+    if (playStop || !decoder || !decoder->pFormatCtx || !decoder->HasVideo()) {
+        QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: video is not ready");
         return false;
     }
-    QString dirPath = QFileInfo("mp4/l").absolutePath();
-    QDir dir(dirPath);
-    if (!dir.exists()) {
-        dir.mkpath(dirPath);
-    }
-    // 保存路径
-    stringstream ss;
-    ss << "mp4/";
-    ss << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-              .count()
-       << ".mp4";
-    // 创建MP4编码器
-    auto encoder = make_shared<Mp4Encoder>(ss.str());
 
-    // 添加音频流
-    if (decoder->HasAudio()) {
-        encoder->addTrack(decoder->pFormatCtx->streams[decoder->audioStreamIndex]);
+    shared_ptr<AVPacket> bootstrapPacket;
+    {
+        lock_guard<mutex> lock(outputMutex);
+        if (_mp4Encoder) {
+            QmlNativeAPI::Instance().PutLog("error", "MP4 recording is already running");
+            return false;
+        }
+        bootstrapPacket = _streamBootstrapPacket;
     }
-    // 添加视频流
-    if (decoder->HasVideo()) {
-        encoder->addTrack(decoder->pFormatCtx->streams[decoder->videoStreamIndex]);
+    if (!bootstrapPacket) {
+        QmlNativeAPI::Instance().PutLog(
+            "error", "MP4 recording failed: wait for a camera keyframe, then try again");
+        return false;
+    }
+
+    QDir outputDirectory(QDir::current().filePath("mp4"));
+    if (!outputDirectory.exists() && !QDir().mkpath(outputDirectory.absolutePath())) {
+        QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: unable to create the mp4 folder");
+        return false;
+    }
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const QString filePath = outputDirectory.filePath(QString::number(timestamp) + ".mp4");
+    auto encoder = make_shared<Mp4Encoder>(filePath.toStdString());
+
+    if (decoder->HasAudio()) {
+        if (!encoder->addTrack(
+                decoder->pFormatCtx->streams[decoder->audioStreamIndex], decoder->pAudioCodecCtx)) {
+            QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: " + encoder->lastError());
+            return false;
+        }
+    }
+    if (!encoder->addTrack(
+            decoder->pFormatCtx->streams[decoder->videoStreamIndex], decoder->pVideoCodecCtx)
+        || !encoder->primeVideoParameters(bootstrapPacket.get())) {
+        QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: " + encoder->lastError());
+        return false;
     }
     if (!encoder->start()) {
+        QFile::remove(filePath);
+        QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: " + encoder->lastError());
         return false;
     }
-    lock_guard<mutex> lock(outputMutex);
-    _mp4Encoder = std::move(encoder);
-    // 启动编码器
+    {
+        lock_guard<mutex> lock(outputMutex);
+        _mp4Encoder = std::move(encoder);
+    }
+    QmlNativeAPI::Instance().PutLog(
+        "info", "MP4 recording started; waiting for the next camera keyframe: " + filePath.toStdString());
     return true;
 }
 
@@ -381,10 +417,17 @@ QString QQuickRealTimePlayer::stopRecord() {
     if (!_mp4Encoder) {
         return {};
     }
-    _mp4Encoder->stop();
     QString path { _mp4Encoder->_saveFilePath.c_str() };
+    const bool ok = _mp4Encoder->stop();
+    const std::string error = _mp4Encoder->lastError();
     _mp4Encoder.reset();
-    return path;
+    if (!ok) {
+        QFile::remove(path);
+        QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: " + error);
+        return {};
+    }
+    QmlNativeAPI::Instance().PutLog("info", "Saved MP4 recording to " + path.toStdString());
+    return QDir::toNativeSeparators(path);
 }
 
 QString QQuickRealTimePlayer::startStream(const QString &streamUrl) {
