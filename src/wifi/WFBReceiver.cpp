@@ -96,20 +96,34 @@ bool WFBReceiver::Start(const std::string &vidPid, uint8_t channel, int channelW
     constexpr uint32_t linkId = 7669206; // sha1 hash of link_domain="default"
     constexpr uint32_t videoChannelId = (linkId << 8) + 0;
     constexpr uint32_t telemetryDownChannelId = (linkId << 8) + 16;
-    videoAggregator = std::make_unique<Aggregator>(
-        keyPath, 0, videoChannelId,
-        [](uint8_t *payload, uint16_t packetSize) { WFBReceiver::Instance().handleRtp(payload, packetSize); },
-        [](const std::string &level, const std::string &message) {
-            QmlNativeAPI::Instance().PutLog(level, message);
-        });
-    telemetryAggregator = std::make_unique<Aggregator>(
-        keyPath, 0, telemetryDownChannelId,
-        [](uint8_t *payload, uint16_t packetSize) {
-            WFBReceiver::Instance().handleTelemetry(payload, packetSize);
-        },
-        [](const std::string &level, const std::string &message) {
-            QmlNativeAPI::Instance().PutLog(level, "Telemetry: " + message);
-        });
+    try {
+        videoAggregator = std::make_unique<Aggregator>(
+            keyPath, 0, videoChannelId,
+            [](uint8_t *payload, uint16_t packetSize) { WFBReceiver::Instance().handleRtp(payload, packetSize); },
+            [](const std::string &level, const std::string &message) {
+                QmlNativeAPI::Instance().PutLog(level, message);
+            });
+        telemetryAggregator = std::make_unique<Aggregator>(
+            keyPath, 0, telemetryDownChannelId,
+            [](uint8_t *payload, uint16_t packetSize) {
+                WFBReceiver::Instance().handleTelemetry(payload, packetSize);
+            },
+            [](const std::string &level, const std::string &message) {
+                QmlNativeAPI::Instance().PutLog(level, "Telemetry: " + message);
+            });
+    } catch (const std::exception &error) {
+        videoAggregator.reset();
+        telemetryAggregator.reset();
+        QmlNativeAPI::Instance().PutLog(
+            "error", "Receiver could not load the encryption key: " + std::string(error.what()));
+        return false;
+    } catch (...) {
+        videoAggregator.reset();
+        telemetryAggregator.reset();
+        QmlNativeAPI::Instance().PutLog(
+            "error", "Receiver could not load the encryption key");
+        return false;
+    }
     int rc;
 
     // get vid pid

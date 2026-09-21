@@ -69,6 +69,12 @@ public:
     };
     Q_INVOKABLE static bool
     Start(const QString &vidPid, int channel, int channelWidth, const QString &keyPath, const QString &codec) {
+        const QFileInfo keyFile(keyPath.trimmed());
+        if (!keyFile.exists() || !keyFile.isFile() || !keyFile.isReadable()) {
+            QmlNativeAPI::Instance().PutLog(
+                "error", "Receiver could not start: select a readable OpenIPC gs.key file");
+            return false;
+        }
         // save config
         mINI::Instance()[CONFIG_CHANNEL] = channel;
         mINI::Instance()[CONFIG_CHANNEL_WIDTH] = channelWidth;
