@@ -50,6 +50,7 @@ include/divisible/*
 build/**/*
 dist/
 .deps/
+*.key
 
 include/*
 lib/*
