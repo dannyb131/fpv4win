@@ -3,6 +3,7 @@
 #include "ffmpegDecode.h"
 #include <QQuickFramebufferObject>
 #include <QQuickItem>
+#include <deque>
 #include <memory>
 #include <queue>
 #include <thread>
@@ -101,6 +102,16 @@ protected:
     // Codec headers plus the first random-access frame, retained so a
     // streaming client can start after the local decoder is already running.
     shared_ptr<AVPacket> _streamBootstrapPacket;
+    struct BufferedRecordPacket {
+        shared_ptr<AVPacket> packet;
+        bool isVideo = false;
+    };
+    // Rolling encoded GOP beginning at the most recent keyframe.  Recording
+    // writes this prefix first, so long camera GOPs do not delay record start.
+    std::deque<BufferedRecordPacket> _recordingBootstrapPackets;
+    size_t _recordingBootstrapBytes = 0;
+    static constexpr size_t MAX_RECORDING_BOOTSTRAP_PACKETS = 8192;
+    static constexpr size_t MAX_RECORDING_BOOTSTRAP_BYTES = 64 * 1024 * 1024;
     // 保护录制器和推流器；解码回调在后台线程运行
     mutex outputMutex;
     // GIF录制器

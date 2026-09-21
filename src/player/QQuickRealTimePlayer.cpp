@@ -191,6 +191,8 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
         {
             lock_guard<mutex> lock(outputMutex);
             _streamBootstrapPacket.reset();
+            _recordingBootstrapPackets.clear();
+            _recordingBootstrapBytes = 0;
         }
         if (decoder->HasVideo()) {
             QmlNativeAPI::Instance().PutLog(
@@ -202,17 +204,35 @@ void QQuickRealTimePlayer::play(const QString &playUrl) {
         }
         decoder->_gotPktCallback = [this](const shared_ptr<AVPacket> &packet) {
             lock_guard<mutex> lock(outputMutex);
-            if (!_streamBootstrapPacket && packet->stream_index == decoder->videoStreamIndex) {
+            const bool isVideo = packet->stream_index == decoder->videoStreamIndex;
+            if (isVideo) {
                 AVStream *stream = decoder->pFormatCtx->streams[decoder->videoStreamIndex];
-                _streamBootstrapPacket = makeBootstrapPacket(packet.get(), stream->codecpar);
-                if (_streamBootstrapPacket) {
+                auto bootstrap = makeBootstrapPacket(packet.get(), stream->codecpar);
+                if (bootstrap) {
+                    _streamBootstrapPacket = std::move(bootstrap);
+                    _recordingBootstrapPackets.clear();
+                    _recordingBootstrapBytes = _streamBootstrapPacket->size;
+                    _recordingBootstrapPackets.push_back({ _streamBootstrapPacket, true });
                     QmlNativeAPI::Instance().PutLog(
-                        "info", "Cached H.265 stream bootstrap: codec headers plus random-access frame ("
+                        "info", "Refreshed video keyframe buffer: codec headers plus random-access frame ("
                             + std::to_string(_streamBootstrapPacket->size) + " bytes)");
+                } else if (!_recordingBootstrapPackets.empty()) {
+                    _recordingBootstrapPackets.push_back({ packet, true });
+                    _recordingBootstrapBytes += packet->size;
                 }
+            } else if (!_recordingBootstrapPackets.empty()) {
+                _recordingBootstrapPackets.push_back({ packet, false });
+                _recordingBootstrapBytes += packet->size;
+            }
+            if (_recordingBootstrapPackets.size() > MAX_RECORDING_BOOTSTRAP_PACKETS
+                || _recordingBootstrapBytes > MAX_RECORDING_BOOTSTRAP_BYTES) {
+                _recordingBootstrapPackets.clear();
+                _recordingBootstrapBytes = 0;
+                QmlNativeAPI::Instance().PutLog(
+                    "error", "Recording pre-roll buffer exceeded its safety limit; waiting for the next keyframe");
             }
             if (_mp4Encoder) {
-                _mp4Encoder->writePacket(packet, packet->stream_index == decoder->videoStreamIndex);
+                _mp4Encoder->writePacket(packet, isVideo);
             }
             if (_streamPublisher && _streamPublisher->isRunning()) {
                 _streamPublisher->enqueuePacket(packet);
@@ -368,6 +388,11 @@ bool QQuickRealTimePlayer::startRecord() {
             return false;
         }
         bootstrapPacket = _streamBootstrapPacket;
+        if (_recordingBootstrapPackets.empty()) {
+            QmlNativeAPI::Instance().PutLog(
+                "error", "MP4 recording failed: waiting for a complete camera keyframe buffer");
+            return false;
+        }
     }
     if (!bootstrapPacket) {
         QmlNativeAPI::Instance().PutLog(
@@ -403,12 +428,20 @@ bool QQuickRealTimePlayer::startRecord() {
         QmlNativeAPI::Instance().PutLog("error", "MP4 recording failed: " + encoder->lastError());
         return false;
     }
+    size_t bufferedPacketCount = 0;
     {
         lock_guard<mutex> lock(outputMutex);
+        // Refresh the snapshot while holding the callback lock so no packets
+        // can be missed between the pre-roll prefix and live recording.
+        for (const auto &buffered : _recordingBootstrapPackets) {
+            encoder->writePacket(buffered.packet, buffered.isVideo);
+            ++bufferedPacketCount;
+        }
         _mp4Encoder = std::move(encoder);
     }
     QmlNativeAPI::Instance().PutLog(
-        "info", "MP4 recording started; waiting for the next camera keyframe: " + filePath.toStdString());
+        "info", "MP4 recording started immediately with " + std::to_string(bufferedPacketCount)
+            + " buffered packets from the latest keyframe: " + filePath.toStdString());
     return true;
 }
 
